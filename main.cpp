@@ -24,7 +24,7 @@ static const int B = 18;
 
 // Read buffer for the chunked line scanner (kept small to respect the MiB-scale
 // memory budget; independent of file size).
-static const size_t CHUNK = 1 << 20; // 1 MiB
+static const size_t CHUNK = 1 << 17; // 128 KiB
 
 static string bucketName(int id) {
     char buf[32];
@@ -97,7 +97,7 @@ static void doInsert(const string& idx, long long val) {
     int b = hashIndex(idx);
     FILE* out = fopen(bucketName(b).c_str(), "ab");
     if (out) {
-        fprintf(out, "%s %lld\n", idx.c_str(), val);
+        fprintf(out, "%s %d\n", idx.c_str(), (int)val);
         fclose(out);
     }
 }
@@ -141,7 +141,7 @@ static void doFind(const string& idx, ostream& os) {
         os << "null\n";
         return;
     }
-    vector<long long> vals;
+    vector<int> vals;
     size_t idxLen = idx.size();
     while (in.next()) {
         const string& l = in.getLine();
@@ -149,7 +149,7 @@ static void doFind(const string& idx, ostream& os) {
         if (l.size() <= idxLen) continue;
         if (l[idxLen] != ' ') continue;
         if (l.compare(0, idxLen, idx) != 0) continue;
-        long long v = 0;
+        int v = 0;
         const char* p = l.data() + idxLen + 1;
         while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); ++p; }
         vals.push_back(v);
