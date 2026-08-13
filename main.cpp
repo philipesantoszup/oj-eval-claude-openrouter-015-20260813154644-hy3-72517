@@ -7,15 +7,15 @@
 //
 // Bucket files hold lines of the form "index value". An index hashes to one of
 // B bucket files; any single operation only scans one (bounded) file.
+//
+// I/O uses C stdio (no <iostream>) to keep the runtime memory baseline small.
 
-#include <iostream>
-#include <fstream>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <queue>
-#include <cstdio>
-#include <cstring>
 
 using namespace std;
 
@@ -23,13 +23,12 @@ using namespace std;
 // we peak at B + 1 files, well under the 20-file limit.
 static const int B = 18;
 
-// Read buffer for the chunked line scanner (kept small to respect the MiB-scale
-// memory budget; independent of file size).
-static const size_t CHUNK = 1 << 17; // 128 KiB
+// Read buffer for the bucket scan (small, independent of file size).
+static const size_t CHUNK = 1 << 16; // 64 KiB
 
 // External-sort tuning for `find`.
 static const int FIND_RUN = 100000;  // values per on-disk sorted run
-static const int FIND_INMEM = 60000; // results up to this size are sorted in RAM
+static const int FIND_INMEM = 50000; // results up to this size are sorted in RAM
 static const int MERGE_FANIN = 16;   // max runs merged simultaneously (bounds RAM)
 static const int RBUF = 2048;        // per-run stream buffer during merge
 
@@ -63,43 +62,6 @@ static void closeAllAppend() {
     for (int i = 0; i < B; ++i) closeAppend(i);
 }
 
-// Chunked, file-backed line scanner. Memory use is bounded by CHUNK plus the
-// current line (at most ~80 bytes here), so it never scales with file size.
-class LineScanner {
-    FILE* f = nullptr;
-    char buf[CHUNK];
-    size_t bufLen = 0, pos = 0;
-    string line;
-public:
-    bool open(const string& name) {
-        f = fopen(name.c_str(), "rb");
-        return f != nullptr;
-    }
-    bool next() {
-        line.clear();
-        for (;;) {
-            if (pos < bufLen) {
-                char* nl = (char*)memchr(buf + pos, '\n', bufLen - pos);
-                if (nl) {
-                    size_t len = (size_t)(nl - (buf + pos));
-                    line.append(buf + pos, len);
-                    pos = (size_t)(nl - buf) + 1;
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    return true;
-                }
-                line.append(buf + pos, bufLen - pos);
-                pos = bufLen;
-            }
-            bufLen = fread(buf, 1, sizeof(buf), f);
-            pos = 0;
-            if (bufLen == 0) return !line.empty();
-        }
-    }
-    const string& getLine() const { return line; }
-    void close() { if (f) { fclose(f); f = nullptr; } }
-};
-
-// Parse a "index value" line and test whether it matches (idx, val).
 static bool lineMatches(const string& line, const string& idx, long long val) {
     size_t sp = line.find(' ');
     if (sp == string::npos) return false;
@@ -121,30 +83,41 @@ static void doInsert(const string& idx, long long val) {
 static void doDelete(const string& idx, long long val) {
     int b = hashIndex(idx);
     string name = bucketName(b);
-    closeAppend(b); // invalidate any cached handle for this bucket
+    closeAppend(b);
     {
         FILE* chk = fopen(name.c_str(), "rb");
-        if (!chk) return; // nothing to delete
+        if (!chk) return;
         fclose(chk);
     }
     string tmp = "kvb_tmp";
     remove(tmp.c_str());
-    LineScanner in;
-    if (!in.open(name)) return;
+    FILE* in = fopen(name.c_str(), "rb");
     FILE* out = fopen(tmp.c_str(), "wb");
+    char buf[CHUNK];
+    size_t blen, bpos = 0;
     string line;
-    while (in.next()) {
-        const string& l = in.getLine();
-        if (!l.empty() && lineMatches(l, idx, val)) continue;
-        fwrite(l.data(), 1, l.size(), out);
-        fputc('\n', out);
+    while ((blen = fread(buf, 1, sizeof(buf), in)) > 0) {
+        bpos = 0;
+        while (bpos < blen) {
+            char* nl = (char*)memchr(buf + bpos, '\n', blen - bpos);
+            size_t segLen = nl ? (size_t)(nl - (buf + bpos)) : (blen - bpos);
+            line.assign(buf + bpos, segLen);
+            if (line.size() && line.back() == '\r') line.pop_back();
+            if (!line.empty() && lineMatches(line, idx, val)) { /* drop */ }
+            else { fwrite(line.data(), 1, line.size(), out); fputc('\n', out); }
+            bpos = nl ? (size_t)(nl - buf) + 1 : blen;
+            if (!nl) break;
+        }
     }
-    in.close();
+    fclose(in);
     fclose(out);
-    rename(tmp.c_str(), name.c_str()); // atomic replace
+    rename(tmp.c_str(), name.c_str());
     {
-        LineScanner chk;
-        if (chk.open(name) && !chk.next()) remove(name.c_str());
+        FILE* chk = fopen(name.c_str(), "rb");
+        char c;
+        bool empty = (chk == nullptr) || (fgetc(chk) == EOF);
+        if (chk) fclose(chk);
+        if (empty) remove(name.c_str());
     }
 }
 
@@ -175,9 +148,9 @@ struct RunReader {
     }
 };
 
-// Merge a batch of runs (each at `offsets[i]` within file `path`, with element
-// counts `counts[i]`) into a single length-prefixed sorted run written to outFile.
-// At most MERGE_FANIN runs are merged at once, keeping memory bounded.
+// Merge a batch of runs (each at offsets[i] within file path, with counts[i])
+// into a single length-prefixed sorted run written to outFile. At most
+// MERGE_FANIN runs are merged at once, keeping memory bounded.
 static void mergeBatch(const string& path, const vector<long>& offsets,
                        const vector<int>& counts, FILE* outFile) {
     int total = 0;
@@ -209,13 +182,13 @@ static void mergeBatch(const string& path, const vector<long>& offsets,
     for (int i = 0; i < k; ++i) fclose(rdrs[i].f);
 }
 
-static void doFind(const string& idx, ostream& os) {
+static void doFind(const string& idx) {
     int b = hashIndex(idx);
     string name = bucketName(b);
-    flushAppend(b); // make sure appended data is visible to the reader
+    flushAppend(b);
     FILE* f = fopen(name.c_str(), "rb");
     if (!f) {
-        os << "null\n";
+        printf("null\n");
         return;
     }
 
@@ -238,14 +211,6 @@ static void doFind(const string& idx, ostream& os) {
         ++runCount;
     };
 
-    // Fast scan: operate directly on the read buffer. A line only ever spans a
-    // block boundary with negligible probability, so the common path does no
-    // copying at all.
-    char blk[CHUNK];
-    size_t blen = 0, bpos = 0;
-    char carry[256];
-    size_t carryLen = 0;
-
     auto processLine = [&](const char* p, size_t len) {
         if (len <= idl) return;
         if (memcmp(p, idp, idl) != 0) return;
@@ -262,6 +227,11 @@ static void doFind(const string& idx, ostream& os) {
         }
     };
 
+    // Fast scan directly on the read buffer (common path does no copying).
+    char blk[CHUNK];
+    size_t blen = 0, bpos = 0;
+    char carry[256];
+    size_t carryLen = 0;
     for (;;) {
         if (bpos == blen) {
             blen = fread(blk, 1, sizeof(blk), f);
@@ -290,7 +260,7 @@ static void doFind(const string& idx, ostream& os) {
                 memcpy(carry + carryLen, blk + bpos, rem);
                 carryLen += rem;
             } else {
-                carryLen = 0; // line absurdly long; skip it
+                carryLen = 0;
             }
             bpos = blen;
         }
@@ -300,26 +270,24 @@ static void doFind(const string& idx, ostream& os) {
     // Small result set: sort in RAM, no temporary file at all.
     if (!external) {
         if (mem.empty()) {
-            os << "null\n";
+            printf("null\n");
         } else {
             sort(mem.begin(), mem.end());
             bool first = true;
             for (int v : mem) {
-                if (!first) os << ' ';
+                if (!first) putchar(' ');
                 first = false;
-                os << v;
+                printf("%d", v);
             }
-            os << '\n';
+            putchar('\n');
         }
         return;
     }
 
-    // Large result set: runs are already written to runsName. Merge them with a
-    // bounded fan-in across passes so memory never scales with the run count.
     if (!mem.empty()) flushRun();
     if (fruns) fclose(fruns);
     if (runCount == 0) {
-        os << "null\n";
+        printf("null\n");
         remove(runsName.c_str());
         return;
     }
@@ -351,14 +319,14 @@ static void doFind(const string& idx, ostream& os) {
                 bool first = true;
                 int v;
                 while (rr.next(v)) {
-                    if (!first) os << ' ';
+                    if (!first) putchar(' ');
                     first = false;
-                    os << v;
+                    printf("%d", v);
                 }
-                os << '\n';
+                putchar('\n');
                 fclose(rf);
             } else {
-                os << "null\n";
+                printf("null\n");
             }
             break;
         }
@@ -378,28 +346,26 @@ static void doFind(const string& idx, ostream& os) {
 }
 
 int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
     int n;
-    if (!(cin >> n)) return 0;
-    string cmd;
+    if (fscanf(stdin, "%d", &n) != 1) return 0;
+    char cmd[32];
+    char idxbuf[128];
+    long long val;
     for (int i = 0; i < n; ++i) {
-        if (!(cin >> cmd)) break;
-        if (cmd == "insert") {
-            string idx; long long val;
-            if (!(cin >> idx >> val)) break;
-            doInsert(idx, val);
-        } else if (cmd == "delete") {
-            string idx; long long val;
-            if (!(cin >> idx >> val)) break;
-            doDelete(idx, val);
-        } else if (cmd == "find") {
-            string idx;
-            if (!(cin >> idx)) break;
-            doFind(idx, cout);
+        if (fscanf(stdin, "%31s", cmd) != 1) break;
+        if (strcmp(cmd, "insert") == 0) {
+            if (fscanf(stdin, "%127s %lld", idxbuf, &val) != 2) break;
+            doInsert(string(idxbuf), val);
+        } else if (strcmp(cmd, "delete") == 0) {
+            if (fscanf(stdin, "%127s %lld", idxbuf, &val) != 2) break;
+            doDelete(string(idxbuf), val);
+        } else if (strcmp(cmd, "find") == 0) {
+            if (fscanf(stdin, "%127s", idxbuf) != 1) break;
+            doFind(string(idxbuf));
         }
+        // unknown command: ignore
     }
     closeAllAppend();
-    cout.flush();
+    fflush(stdout);
     return 0;
 }
