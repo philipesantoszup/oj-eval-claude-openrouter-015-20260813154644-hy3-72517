@@ -28,8 +28,9 @@ static const int B = 18;
 static const size_t CHUNK = 1 << 17; // 128 KiB
 
 // External-sort tuning for `find`.
-static const int FIND_RUN = 45000;   // values per on-disk sorted run
+static const int FIND_RUN = 100000;  // values per on-disk sorted run
 static const int FIND_INMEM = 60000; // results up to this size are sorted in RAM
+static const int MERGE_FANIN = 16;   // max runs merged simultaneously (bounds RAM)
 static const int RBUF = 2048;        // per-run stream buffer during merge
 
 static string bucketName(int id) {
@@ -174,6 +175,40 @@ struct RunReader {
     }
 };
 
+// Merge a batch of runs (each at `offsets[i]` within file `path`, with element
+// counts `counts[i]`) into a single length-prefixed sorted run written to outFile.
+// At most MERGE_FANIN runs are merged at once, keeping memory bounded.
+static void mergeBatch(const string& path, const vector<long>& offsets,
+                       const vector<int>& counts, FILE* outFile) {
+    int total = 0;
+    for (int c : counts) total += c;
+    fwrite(&total, sizeof(int), 1, outFile);
+    int k = (int)offsets.size();
+    vector<RunReader> rdrs(k);
+    for (int i = 0; i < k; ++i) {
+        FILE* rf = fopen(path.c_str(), "rb");
+        fseek(rf, offsets[i], SEEK_SET);
+        int sz = 0;
+        fread(&sz, sizeof(int), 1, rf);
+        rdrs[i].f = rf;
+        rdrs[i].remaining = sz;
+        rdrs[i].pos = 0;
+        rdrs[i].len = 0;
+    }
+    priority_queue<pair<int, int>, vector<pair<int, int>>, greater<pair<int, int>>> pq;
+    for (int i = 0; i < k; ++i) {
+        int v;
+        if (rdrs[i].next(v)) pq.push({ v, i });
+    }
+    while (!pq.empty()) {
+        auto [v, i] = pq.top(); pq.pop();
+        fwrite(&v, sizeof(int), 1, outFile);
+        int nv;
+        if (rdrs[i].next(nv)) pq.push({ nv, i });
+    }
+    for (int i = 0; i < k; ++i) fclose(rdrs[i].f);
+}
+
 static void doFind(const string& idx, ostream& os) {
     int b = hashIndex(idx);
     string name = bucketName(b);
@@ -279,7 +314,8 @@ static void doFind(const string& idx, ostream& os) {
         return;
     }
 
-    // Large result set: keep streaming into bounded sorted runs, then merge.
+    // Large result set: runs are already written to runsName. Merge them with a
+    // bounded fan-in across passes so memory never scales with the run count.
     if (!mem.empty()) flushRun();
     if (fruns) fclose(fruns);
     if (runCount == 0) {
@@ -288,51 +324,57 @@ static void doFind(const string& idx, ostream& os) {
         return;
     }
 
-    // Discover run boundaries, then k-way merge all runs with tiny buffers.
-    vector<long> offsets(runCount);
-    {
-        FILE* fc = fopen(runsName.c_str(), "rb");
-        long off = 0;
-        for (int i = 0; i < runCount; ++i) {
-            offsets[i] = off;
-            int sz = 0;
-            fread(&sz, sizeof(int), 1, fc);
-            off += (long)sizeof(int) + (long)sz * sizeof(int);
-            fseek(fc, (long)sz * sizeof(int), SEEK_CUR);
+    string cur = runsName;
+    for (;;) {
+        vector<long> offsets;
+        vector<int> counts;
+        {
+            FILE* fc = fopen(cur.c_str(), "rb");
+            long off = 0;
+            for (;;) {
+                int sz = 0;
+                if (fread(&sz, sizeof(int), 1, fc) != 1) break;
+                offsets.push_back(off);
+                counts.push_back(sz);
+                off += (long)sizeof(int) + (long)sz * sizeof(int);
+                fseek(fc, (long)sz * sizeof(int), SEEK_CUR);
+            }
+            fclose(fc);
         }
-        fclose(fc);
+        if (offsets.size() <= 1) {
+            if (!offsets.empty()) {
+                FILE* rf = fopen(cur.c_str(), "rb");
+                fseek(rf, offsets[0], SEEK_SET);
+                int sz = 0;
+                fread(&sz, sizeof(int), 1, rf);
+                RunReader rr; rr.f = rf; rr.remaining = sz; rr.pos = 0; rr.len = 0;
+                bool first = true;
+                int v;
+                while (rr.next(v)) {
+                    if (!first) os << ' ';
+                    first = false;
+                    os << v;
+                }
+                os << '\n';
+                fclose(rf);
+            } else {
+                os << "null\n";
+            }
+            break;
+        }
+        string nxt = (cur == runsName) ? "kvb_find_tmp2" : runsName;
+        FILE* fout = fopen(nxt.c_str(), "wb");
+        for (size_t s = 0; s < offsets.size(); s += MERGE_FANIN) {
+            size_t e = min(s + (size_t)MERGE_FANIN, offsets.size());
+            vector<long> bo(offsets.begin() + s, offsets.begin() + e);
+            vector<int> bc(counts.begin() + s, counts.begin() + e);
+            mergeBatch(cur, bo, bc, fout);
+        }
+        fclose(fout);
+        cur = nxt;
     }
-
-    vector<RunReader> rdrs(runCount);
-    for (int i = 0; i < runCount; ++i) {
-        FILE* rf = fopen(runsName.c_str(), "rb");
-        fseek(rf, offsets[i], SEEK_SET);
-        int sz = 0;
-        fread(&sz, sizeof(int), 1, rf);
-        rdrs[i].f = rf;
-        rdrs[i].remaining = sz;
-        rdrs[i].pos = 0;
-        rdrs[i].len = 0;
-    }
-
-    priority_queue<pair<int, int>, vector<pair<int, int>>, greater<pair<int, int>>> pq;
-    for (int i = 0; i < runCount; ++i) {
-        int v;
-        if (rdrs[i].next(v)) pq.push({ v, i });
-    }
-    bool first = true;
-    while (!pq.empty()) {
-        auto [v, i] = pq.top(); pq.pop();
-        if (!first) os << ' ';
-        first = false;
-        os << v;
-        int nv;
-        if (rdrs[i].next(nv)) pq.push({ nv, i });
-    }
-    os << '\n';
-
-    for (int i = 0; i < runCount; ++i) fclose(rdrs[i].f);
     remove(runsName.c_str());
+    remove("kvb_find_tmp2");
 }
 
 int main() {
